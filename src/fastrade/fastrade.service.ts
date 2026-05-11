@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { AuthService } from '../auth/auth.service';
 import { StockityWebSocketClient } from '../schedule/websocket-client';
 import { FttExecutor } from './ftt-executor';
@@ -25,7 +25,7 @@ export class FastradeService implements OnModuleDestroy {
   private modes = new Map<string, FastradeMode>();
 
   constructor(
-    private readonly firebaseService: FirebaseService,
+    private readonly supabaseService: SupabaseService,
     private readonly authService: AuthService,
   ) {}
 
@@ -51,14 +51,15 @@ export class FastradeService implements OnModuleDestroy {
 
     const session = await this.authService.getSession(userId);
     if (!session) throw new Error('Session tidak ditemukan. Silakan login ulang.');
-    if (!session.stockityToken) throw new Error('Token Stockity tidak ditemukan. Silakan login ulang.');
+    // ✅ FIX: Supabase returns snake_case columns — gunakan snake_case bukan camelCase
+    if (!session.stockity_token) throw new Error('Token Stockity tidak ditemukan. Silakan login ulang.');
 
     const sessionInfo: SessionInfo = {
-      stockityToken: session.stockityToken,
-      deviceId: session.deviceId,
-      deviceType: session.deviceType || 'web',
-      userAgent: session.userAgent,
-      userTimezone: session.userTimezone || 'Asia/Jakarta',
+      stockityToken: session.stockity_token,
+      deviceId: session.device_id,
+      deviceType: session.device_type || 'web',
+      userAgent: session.user_agent,
+      userTimezone: session.user_timezone || 'Asia/Jakarta',
     };
 
     const config: FastradeConfig = {
@@ -74,10 +75,10 @@ export class FastradeService implements OnModuleDestroy {
     // Create fresh WS connection
     const ws = new StockityWebSocketClient(
       userId,
-      session.stockityToken,
-      session.deviceId,
-      session.deviceType || 'web',
-      session.userAgent,
+      session.stockity_token,
+      session.device_id,
+      session.device_type || 'web',
+      session.user_agent,
     );
 
     ws.setOnStatusChange((connected, reason) => {
@@ -111,15 +112,15 @@ export class FastradeService implements OnModuleDestroy {
         }
         if (arr.length > 500) arr.splice(0, arr.length - 500);
         this.logs.set(userId, arr);
-        this.appendLogToFirebase(userId, enriched).catch(() => {});
+        this.appendLogToSupabase(userId, enriched).catch(() => {});
       },
       onStatusChange: (status) => {
         this.logger.debug(`[${userId}] ${status}`);
-        this.updateFirebaseStatus(userId, { lastStatus: status }).catch(() => {});
+        this.updateSupabaseStatus(userId, { lastStatus: status }).catch(() => {});
       },
       onStopped: () => {
         this.logger.log(`[${userId}] Fastrade stopped`);
-        this.updateFirebaseStatus(userId, { botState: 'STOPPED' }).catch(() => {});
+        this.updateSupabaseStatus(userId, { botState: 'STOPPED' }).catch(() => {});
         this.cleanup(userId);
       },
     };
@@ -136,12 +137,12 @@ export class FastradeService implements OnModuleDestroy {
     executor.start();
 
     const accountType = dto.isDemoAccount ? 'Demo' : 'Real';
-    await this.updateFirebaseStatus(userId, {
+    await this.updateSupabaseStatus(userId, {
       botState: 'RUNNING',
       mode: dto.mode,
       asset: dto.asset.ric,
       isDemoAccount: dto.isDemoAccount,
-      startedAt: this.firebaseService.FieldValue.serverTimestamp(),
+      startedAt: this.supabaseService.now(),
     });
 
     this.logger.log(
@@ -165,9 +166,9 @@ export class FastradeService implements OnModuleDestroy {
 
     const mode = this.modes.get(userId);
     executor.stop();
-    await this.updateFirebaseStatus(userId, {
+    await this.updateSupabaseStatus(userId, {
       botState: 'STOPPED',
-      stoppedAt: this.firebaseService.FieldValue.serverTimestamp(),
+      stoppedAt: this.supabaseService.now(),
     });
     this.cleanup(userId);
 
@@ -206,24 +207,21 @@ export class FastradeService implements OnModuleDestroy {
     const mem = this.logs.get(userId) || [];
     if (mem.length > 0) return mem.slice(-limit);
 
-    // Fallback: Firebase
-    const snap = await this.firebaseService.db
-      .collection('fastrade_logs')
-      .doc(userId)
-      .collection('entries')
-      .orderBy('executedAt', 'desc')
-      .limit(limit)
-      .get();
+    // Fallback: Supabase
+    const { data, error } = await this.supabaseService.client
+      .from('mode_logs')
+      .select('data, executed_at')
+      .eq('user_id', userId)
+      .in('mode', ['FTT', 'CTC'])
+      .order('executed_at', { ascending: false })
+      .limit(limit);
 
-    // FIX: Firestore mengembalikan executedAt sebagai Timestamp object, bukan number.
-    // Konversi ke millis agar frontend tidak menghasilkan "Invalid Date".
-    return snap.docs.map((d) => {
-      const data = d.data() as any;
-      return {
-        ...data,
-        executedAt: data.executedAt?.toMillis?.() ?? data.executedAt ?? 0,
-      } as FastradeLog;
-    });
+    if (error || !data) return [];
+
+    return data.map((row) => ({
+      ...(row.data as FastradeLog),
+      executedAt: new Date(row.executed_at).getTime(),
+    }));
   }
 
   // ── Private helpers ────────────────────────────────
@@ -235,25 +233,30 @@ export class FastradeService implements OnModuleDestroy {
     this.modes.delete(userId);
   }
 
-  private async updateFirebaseStatus(userId: string, data: Record<string, any>) {
-    await this.firebaseService.db
-      .collection('fastrade_status')
-      .doc(userId)
-      .set(
-        { ...data, updatedAt: this.firebaseService.FieldValue.serverTimestamp() },
-        { merge: true },
-      );
+  private async updateSupabaseStatus(userId: string, data: Record<string, any>) {
+    await this.supabaseService.client
+      .from('fastrade_status')
+      .upsert({
+        user_id: userId,
+        ...(data.botState      !== undefined && { bot_state:       data.botState }),
+        ...(data.mode          !== undefined && { mode:            data.mode }),
+        ...(data.asset         !== undefined && { asset:           data.asset }),
+        ...(data.isDemoAccount !== undefined && { is_demo_account: data.isDemoAccount }),
+        ...(data.startedAt     !== undefined && { started_at:      data.startedAt }),
+        ...(data.stoppedAt     !== undefined && { stopped_at:      data.stoppedAt }),
+        updated_at: this.supabaseService.now(),
+      }, { onConflict: 'user_id' });
   }
 
-  private async appendLogToFirebase(userId: string, log: FastradeLog) {
-    await this.firebaseService.db
-      .collection('fastrade_logs')
-      .doc(userId)
-      .collection('entries')
-      .doc(log.id)
-      .set({
-        ...log,
-        executedAt: this.firebaseService.Timestamp.fromMillis(log.executedAt),
-      });
+  private async appendLogToSupabase(userId: string, log: FastradeLog) {
+    await this.supabaseService.client
+      .from('mode_logs')
+      .upsert({
+        id: log.id,
+        user_id: userId,
+        mode: log.mode ?? 'FTT',
+        data: log,
+        executed_at: this.supabaseService.timestampFromMillis(log.executedAt),
+      }, { onConflict: 'id' });
   }
 }

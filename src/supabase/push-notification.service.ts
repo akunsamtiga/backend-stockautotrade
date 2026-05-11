@@ -1,6 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as admin from 'firebase-admin';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,36 +8,64 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
-/**
- * FirebaseMessagingService
- *
- * Drop-in replacement for firebase-admin messaging that sends FCM messages
- * via the FCM HTTP v1 REST API using the system `curl` binary instead of
- * Node.js's built-in HTTP client.
- *
- * WHY: This VPS blocks outbound TLS connections made by Node.js (Cloudflare
- * JA3/JA4 fingerprint filtering). The firebase-admin SDK fetches its OAuth2
- * access token using Node's HTTP stack → the request silently hangs →
- * "Error while making request: ." in the logs.
- *
- * SOLUTION: Mirror the same pattern used in auth.service.ts and http-utils.ts:
- *   1. Build & sign a service-account JWT locally (pure crypto, no network).
- *   2. Exchange JWT → short-lived OAuth2 access token via curlPost().
- *   3. Call the FCM v1 send endpoint via curlPost().
- *
- * The public API surface (.send / .sendToTopic / .sendMulticast) is kept
- * identical so callers (AISignalService, etc.) need zero changes.
- */
-
 interface ServiceAccount {
   project_id: string;
   client_email: string;
   private_key: string;
 }
 
+export interface PushMessage {
+  token?: string;
+  topic?: string;
+  condition?: string;
+  data?: Record<string, string>;
+  notification?: {
+    title: string;
+    body: string;
+  };
+  android?: {
+    priority?: 'high' | 'normal';
+    ttl?: number | string;
+    notification?: {
+      title?: string;
+      body?: string;
+      sound?: string;
+      channelId?: string;
+      priority?: 'high' | 'default';
+    };
+  };
+  apns?: any;
+  webpush?: any;
+}
+
+export interface PushPayload {
+  notification?: {
+    title?: string;
+    body?: string;
+    [key: string]: any;
+  };
+  data?: Record<string, string>;
+}
+
+export interface PushTopicResponse {
+  messageId: number;
+}
+
+export interface PushSendResponse {
+  success: boolean;
+  messageId?: string;
+  error?: any;
+}
+
+export interface PushBatchResponse {
+  responses: PushSendResponse[];
+  successCount: number;
+  failureCount: number;
+}
+
 @Injectable()
-export class FirebaseMessagingService implements OnModuleInit {
-  private readonly logger = new Logger(FirebaseMessagingService.name);
+export class PushNotificationService implements OnModuleInit {
+  private readonly logger = new Logger(PushNotificationService.name);
 
   /** Cached OAuth2 access token + expiry */
   private cachedToken: string | null = null;
@@ -49,28 +76,28 @@ export class FirebaseMessagingService implements OnModuleInit {
 
   constructor(private readonly configService: ConfigService) {}
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Module init: load service account (same logic as firebase.service.ts)
-  // ─────────────────────────────────────────────────────────────────────────
-
   onModuleInit() {
-    const serviceAccountPath = this.configService.get<string>('FIREBASE_SERVICE_ACCOUNT_PATH');
+    const serviceAccountPath = this.configService.get<string>('FCM_SERVICE_ACCOUNT_PATH')
+      // fallback removed during migration
 
     if (serviceAccountPath) {
       const resolved = path.resolve(process.cwd(), serviceAccountPath);
       if (fs.existsSync(resolved)) {
         this.serviceAccount = JSON.parse(fs.readFileSync(resolved, 'utf8'));
         this.projectId = this.serviceAccount!.project_id;
-        this.logger.log('✅ FirebaseMessagingService: service account loaded from file');
+        this.logger.log('✅ PushNotificationService: service account loaded from file');
         return;
       }
       this.logger.warn(`Service account file not found at ${resolved}, falling back to env vars`);
     }
 
     // Fall back to individual env vars
-    const projectId   = this.configService.get<string>('FIREBASE_PROJECT_ID');
-    const clientEmail = this.configService.get<string>('FIREBASE_CLIENT_EMAIL');
-    const privateKey  = this.configService.get<string>('FIREBASE_PRIVATE_KEY');
+    const projectId   = this.configService.get<string>('FCM_PROJECT_ID')
+      
+    const clientEmail = this.configService.get<string>('FCM_CLIENT_EMAIL')
+      
+    const privateKey  = this.configService.get<string>('FCM_PRIVATE_KEY')
+      
 
     if (projectId && clientEmail && privateKey) {
       this.serviceAccount = {
@@ -79,9 +106,9 @@ export class FirebaseMessagingService implements OnModuleInit {
         private_key:  privateKey.replace(/\\n/g, '\n'),
       };
       this.projectId = projectId;
-      this.logger.log('✅ FirebaseMessagingService: service account loaded from env vars');
+      this.logger.log('✅ PushNotificationService: service account loaded from env vars');
     } else {
-      this.logger.error('❌ FirebaseMessagingService: no service account configured');
+      this.logger.error('❌ PushNotificationService: no service account configured');
     }
   }
 
@@ -100,7 +127,7 @@ export class FirebaseMessagingService implements OnModuleInit {
       aud:   'https://oauth2.googleapis.com/token',
       iat:   now,
       exp:   now + 3600,
-      scope: 'https://www.googleapis.com/auth/firebase.messaging',
+      scope: 'https://www.googleapis.com/auth/firebase.messaging',  // Google FCM OAuth2 scope
     })).toString('base64url');
 
     const signingInput = `${header}.${payload}`;
@@ -206,21 +233,16 @@ export class FirebaseMessagingService implements OnModuleInit {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // admin.messaging.Message → FCM v1 REST shape converter
+  // Message → FCM v1 REST shape converter
   // ─────────────────────────────────────────────────────────────────────────
 
-  /**
-   * Convert a firebase-admin Message object (v9 shape) into the FCM HTTP v1
-   * REST API message body.  Only the fields used by AISignalService are mapped;
-   * extend as needed.
-   */
-  private toRestMessage(message: admin.messaging.Message): object {
+  private toRestMessage(message: PushMessage): object {
     const rest: Record<string, any> = {};
 
     // Routing
-    if ('token'     in message) rest['token']     = (message as any).token;
-    if ('topic'     in message) rest['topic']     = (message as any).topic;
-    if ('condition' in message) rest['condition'] = (message as any).condition;
+    if (message.token)     rest['token']     = message.token;
+    if (message.topic)     rest['topic']     = message.topic;
+    if (message.condition) rest['condition'] = message.condition;
 
     // Data payload
     if (message.data) rest['data'] = message.data;
@@ -234,7 +256,7 @@ export class FirebaseMessagingService implements OnModuleInit {
     }
 
     // Android config
-    const android = (message as any).android as admin.messaging.AndroidConfig | undefined;
+    const android = message.android;
     if (android) {
       const androidRest: Record<string, any> = {};
 
@@ -243,22 +265,20 @@ export class FirebaseMessagingService implements OnModuleInit {
       }
 
       if (android.ttl !== undefined) {
-        // admin SDK accepts timedelta ms number; REST API wants "<seconds>s"
         const ttlMs = typeof android.ttl === 'number' ? android.ttl : (android.ttl as any);
         androidRest['ttl'] = `${Math.round(ttlMs / 1000)}s`;
       }
 
-      const notif = android.notification as admin.messaging.AndroidNotification | undefined;
+      const notif = android.notification;
       if (notif) {
         androidRest['notification'] = {
           ...(notif.title     && { title:      notif.title }),
           ...(notif.body      && { body:       notif.body }),
           ...(notif.sound     && { sound:      notif.sound }),
           ...(notif.channelId && { channel_id: notif.channelId }),
-          // Map priority string
-          ...((notif as any).priority && {
+          ...(notif.priority && {
             notification_priority:
-              (notif as any).priority === 'high' ? 'PRIORITY_HIGH' : 'PRIORITY_DEFAULT',
+              notif.priority === 'high' ? 'PRIORITY_HIGH' : 'PRIORITY_DEFAULT',
           }),
         };
       }
@@ -267,23 +287,23 @@ export class FirebaseMessagingService implements OnModuleInit {
     }
 
     // APNS config (pass-through if present)
-    if ((message as any).apns) rest['apns'] = (message as any).apns;
+    if (message.apns) rest['apns'] = message.apns;
 
     // WebPush config
-    if ((message as any).webpush) rest['webpush'] = (message as any).webpush;
+    if (message.webpush) rest['webpush'] = message.webpush;
 
     return rest;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // Public API  (identical signatures to original service)
+  // Public API
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
    * Send a message to a specific device, topic, or condition.
    * Returns the FCM message name (e.g. "projects/xxx/messages/yyy").
    */
-  async send(message: admin.messaging.Message): Promise<string> {
+  async send(message: PushMessage): Promise<string> {
     try {
       const restMsg  = this.toRestMessage(message);
       const response = await this.curlFcmSend(restMsg);
@@ -301,9 +321,9 @@ export class FirebaseMessagingService implements OnModuleInit {
    */
   async sendToTopic(
     topic: string,
-    payload: admin.messaging.MessagingPayload,
-    _options?: admin.messaging.MessagingOptions,
-  ): Promise<admin.messaging.MessagingTopicResponse> {
+    payload: PushPayload,
+    _options?: any,
+  ): Promise<PushTopicResponse> {
     try {
       const restMsg: Record<string, any> = { topic };
       if (payload.notification) restMsg['notification'] = payload.notification;
@@ -311,7 +331,7 @@ export class FirebaseMessagingService implements OnModuleInit {
 
       await this.curlFcmSend(restMsg);
       this.logger.log(`Message sent to topic '${topic}'`);
-      return { messageId: 0, failedRegistrationTokens: [] } as any;
+      return { messageId: 0 };
     } catch (error: any) {
       this.logger.error(`Failed to send to topic '${topic}': ${error?.message || error}`);
       throw error;
@@ -324,17 +344,17 @@ export class FirebaseMessagingService implements OnModuleInit {
    * and aggregate results, exactly like the admin SDK does internally.
    */
   async sendMulticast(
-    message: admin.messaging.MulticastMessage,
-  ): Promise<admin.messaging.BatchResponse> {
+    message: PushMessage & { tokens: string[] },
+  ): Promise<PushBatchResponse> {
     const { tokens, ...rest } = message as any;
-    const responses: admin.messaging.SendResponse[] = [];
+    const responses: PushSendResponse[] = [];
 
     for (const token of tokens as string[]) {
       try {
         const msgName = await this.curlFcmSend(this.toRestMessage({ ...rest, token }));
-        responses.push({ success: true, messageId: msgName } as any);
+        responses.push({ success: true, messageId: msgName });
       } catch (err: any) {
-        responses.push({ success: false, error: err } as any);
+        responses.push({ success: false, error: err });
       }
     }
 
@@ -354,14 +374,14 @@ export class FirebaseMessagingService implements OnModuleInit {
   async subscribeToTopic(tokens: string | string[], topic: string): Promise<void> {
     this.logger.warn(
       `subscribeToTopic('${topic}') is not supported via REST API without a legacy server key. ` +
-      `Subscribe on the client side using Firebase SDK instead.`,
+        `Subscribe on the client side using push notification SDK instead.`,
     );
   }
 
   async unsubscribeFromTopic(tokens: string | string[], topic: string): Promise<void> {
     this.logger.warn(
       `unsubscribeFromTopic('${topic}') is not supported via REST API without a legacy server key. ` +
-      `Unsubscribe on the client side using Firebase SDK instead.`,
+        `Unsubscribe on the client side using push notification SDK instead.`,
     );
   }
 }

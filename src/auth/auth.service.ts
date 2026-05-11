@@ -1,6 +1,6 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
@@ -20,7 +20,7 @@ export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
   /**
-   * In-memory session cache untuk mengurangi read Firestore.
+   * In-memory session cache untuk mengurangi read Supabase.
    * TTL: 30 detik — cukup untuk burst request dari frontend polling,
    * tapi tidak terlalu lama agar session updates tetap terbaca.
    */
@@ -29,7 +29,7 @@ export class AuthService {
 
   constructor(
     private jwtService: JwtService,
-    private firebaseService: FirebaseService,
+    private supabaseService: SupabaseService,
   ) {}
 
   // ── Cache helpers ─────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ export class AuthService {
     });
   }
 
-  private invalidateSessionCache(userId: string) {
+  invalidateSessionCache(userId: string) {
     this.sessionCache.delete(userId);
   }
 
@@ -105,16 +105,19 @@ export class AuthService {
     // Ambil deviceId lama jika sudah pernah login
     let deviceId = uuidv4();
     try {
-      const existing = await this.firebaseService.db
-        .collection('sessions')
-        .where('email', '==', email)
+      const { data: existing } = await this.supabaseService.client
+        .from('sessions')
+        .select('device_id')
+        .eq('email', email)
         .limit(1)
-        .get();
-      if (!existing.empty) {
-        const data = existing.docs[0].data();
-        if (data.deviceId) deviceId = data.deviceId;
+        .maybeSingle();
+      if (existing?.device_id) {
+        deviceId = existing.device_id;
+        this.logger.log(`Reusing existing deviceId for ${email}`);
       }
-    } catch (_) {}
+    } catch (e) {
+      this.logger.warn(`Gagal ambil deviceId lama, pakai baru: ${e}`);
+    }
 
     let stockityAuthToken: string;
     let stockityUserId: string;
@@ -193,27 +196,60 @@ export class AuthService {
       throw new UnauthorizedException(errMsg);
     }
 
-    // Simpan session ke Firebase
-    await this.firebaseService.db
-      .collection('sessions')
-      .doc(stockityUserId)
-      .set(
-        {
-          email,
-          userId:        stockityUserId,
-          stockityToken: stockityAuthToken,
-          deviceId,
-          deviceType:    'web',
-          userAgent:     DEFAULT_USER_AGENT,
-          userTimezone:  DEFAULT_TIMEZONE,
-          currency:      'IDR',
-          currencyIso:   'IDR',
-          updatedAt:     this.firebaseService.FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
+    // ── Simpan session ke Supabase ────────────────────────────────────────────
+    // ✅ FIX: Cek error dari upsert — sebelumnya error diabaikan sehingga JWT
+    //    diterbitkan meski session tidak tersimpan → semua request berikutnya 401.
+    const { error: upsertError } = await this.supabaseService.client
+      .from('sessions')
+      .upsert({
+        user_id:        stockityUserId,
+        email,
+        stockity_token: stockityAuthToken,
+        device_id:      deviceId,
+        device_type:    'web',
+        user_agent:     DEFAULT_USER_AGENT,
+        user_timezone:  DEFAULT_TIMEZONE,
+        currency:       'IDR',
+        currency_iso:   'IDR',
+        updated_at:     this.supabaseService.now(),
+        // ✅ FIX: logged_out_at TIDAK di-include di upsert karena beberapa
+        //    versi Supabase client skip null saat conflict update.
+        //    Di-reset via explicit UPDATE di bawah supaya pasti NULL.
+      });
 
-    // Invalidate cache setelah write
+    if (upsertError) {
+      this.logger.error(
+        `❌ Gagal upsert session ke Supabase untuk userId=${stockityUserId}: ` +
+        `code=${upsertError.code} | message=${upsertError.message} | ` +
+        `details=${upsertError.details} | hint=${upsertError.hint}`,
+      );
+      throw new UnauthorizedException(
+        'Gagal menyimpan sesi ke server. Coba login ulang.',
+      );
+    }
+
+    this.logger.log(`✅ Session upserted ke Supabase untuk userId=${stockityUserId}`);
+
+    // ✅ FIX: Reset logged_out_at secara eksplisit via UPDATE terpisah.
+    //    Ini memastikan field benar-benar NULL meski upsert conflict-update
+    //    melewatkan null values.
+    const { error: resetError } = await this.supabaseService.client
+      .from('sessions')
+      .update({ logged_out_at: null })
+      .eq('user_id', stockityUserId);
+
+    if (resetError) {
+      // Tidak fatal — session sudah terupsert, hanya logged_out_at yang gagal.
+      // Log warning supaya bisa di-debug, tapi lanjut proses login.
+      this.logger.warn(
+        `⚠️ Gagal reset logged_out_at untuk userId=${stockityUserId}: ` +
+        `code=${resetError.code} | message=${resetError.message}`,
+      );
+    } else {
+      this.logger.log(`✅ logged_out_at di-reset NULL untuk userId=${stockityUserId}`);
+    }
+
+    // Invalidate cache setelah write supaya request berikutnya baca dari DB
     this.invalidateSessionCache(stockityUserId);
 
     const jwt = this.jwtService.sign({ sub: stockityUserId, email });
@@ -228,9 +264,15 @@ export class AuthService {
   }
 
   async logout(userId: string) {
-    await this.firebaseService.db.collection('sessions').doc(userId).update({
-      loggedOutAt: this.firebaseService.FieldValue.serverTimestamp(),
-    });
+    const { error } = await this.supabaseService.client
+      .from('sessions')
+      .update({ logged_out_at: this.supabaseService.now() })
+      .eq('user_id', userId);
+
+    if (error) {
+      this.logger.warn(`Gagal update logged_out_at saat logout userId=${userId}: ${error.message}`);
+    }
+
     this.invalidateSessionCache(userId);
     return { message: 'Logout berhasil' };
   }
@@ -239,36 +281,42 @@ export class AuthService {
     const cached = this.getCachedSession(userId);
     if (cached) {
       return {
-        userId:      cached.userId,
+        userId:      cached.user_id,
         email:       cached.email,
-        deviceId:    cached.deviceId,
+        deviceId:    cached.device_id,
         currency:    cached.currency,
-        currencyIso: cached.currencyIso,
+        currencyIso: cached.currency_iso,
       };
     }
 
-    const docSnap = await this.firebaseService.db.collection('sessions').doc(userId).get();
-    if (!docSnap.exists) throw new UnauthorizedException('Session tidak ditemukan');
-    const data = docSnap.data();
+    const { data, error } = await this.supabaseService.client
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !data) throw new UnauthorizedException('Session tidak ditemukan');
     this.setCachedSession(userId, data);
     return {
-      userId:      data.userId,
+      userId:      data.user_id,
       email:       data.email,
-      deviceId:    data.deviceId,
+      deviceId:    data.device_id,
       currency:    data.currency,
-      currencyIso: data.currencyIso,
+      currencyIso: data.currency_iso,
     };
   }
 
   async getSession(userId: string) {
     const cached = this.getCachedSession(userId);
-    if (cached) {
-      return cached;
-    }
+    if (cached) return cached;
 
-    const docSnap = await this.firebaseService.db.collection('sessions').doc(userId).get();
-    if (!docSnap.exists) return null;
-    const data = docSnap.data();
+    const { data, error } = await this.supabaseService.client
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !data) return null;
     this.setCachedSession(userId, data);
     return data;
   }
