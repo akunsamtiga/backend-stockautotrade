@@ -42,6 +42,16 @@ export interface MomentumConfig {
     multiplierValue: number;
     multiplierType: 'FIXED' | 'PERCENTAGE';
     isAlwaysSignal: boolean;
+    /**
+     * Stop Loss: bot otomatis berhenti jika total kerugian sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopLoss?: number;
+    /**
+     * Stop Profit: bot otomatis berhenti jika total keuntungan sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopProfit?: number;
   };
   isDemoAccount: boolean;
   currency: string;
@@ -126,6 +136,8 @@ export class MomentumService implements OnModuleDestroy {
           multiplierValue: 2.5,
           multiplierType: 'FIXED',
           isAlwaysSignal: false,
+          stopLoss: 0,
+          stopProfit: 0,
         },
         isDemoAccount: data.is_demo_account ?? true,
         currency: data.currency || 'IDR',
@@ -149,6 +161,8 @@ export class MomentumService implements OnModuleDestroy {
         multiplierValue: 2.5,
         multiplierType: 'FIXED',
         isAlwaysSignal: false,
+        stopLoss: 0,
+        stopProfit: 0,
       },
       isDemoAccount: true,
       currency: 'IDR',
@@ -808,6 +822,7 @@ export class MomentumService implements OnModuleDestroy {
     if (!mode) return;
 
     if (config.martingale.isAlwaysSignal && mode.alwaysSignalLossState?.hasOutstandingLoss) {
+      // Pass signal.trend (dari candle pattern baru) — bukan trend dari loss state lama.
       await this.executeAlwaysSignalMartingale(userId, config, session, signal);
       return;
     }
@@ -896,16 +911,19 @@ export class MomentumService implements OnModuleDestroy {
     const step = lossState.currentMartingaleStep;
 
     if (step > config.martingale.maxSteps) {
-      this.logger.log(`[${userId}] Always Signal: Max steps reached - RESET`);
+      this.logger.log(`[${userId}] 📊 Always Signal: Max steps (${config.martingale.maxSteps}) reached — loss state di-reset`);
       mode.alwaysSignalLossState = null;
       return;
     }
 
     const amount = this.calculateMartingaleAmount(config, step);
+    // FIX: Gunakan signal.trend (dari candle pattern baru), bukan lossState.currentTrend (trend lama).
+    // Always signal hanya menaikkan amount — arah trade mengikuti sinyal momentum baru.
+    const trend = signal.trend;
 
     this.logger.log(
       `[${userId}] 🔄 Always Signal: Executing step ${step}/${config.martingale.maxSteps} ` +
-      `trend=${lossState.currentTrend} amount=${amount}`
+      `trend=${trend} (dari sinyal ${signal.momentumType}) amount=${amount}`
     );
 
     const orderId = uuidv4();
@@ -915,16 +933,16 @@ export class MomentumService implements OnModuleDestroy {
       id: orderId,
       orderId,
       momentumType: lossState.momentumType,
-      trend: lossState.currentTrend,
+      trend,
       amount,
       martingaleStep: step,
       executedAt: currentTime,
-      note: `Always Signal Martingale step ${step}/${config.martingale.maxSteps}`,
+      note: `Always Signal Martingale step ${step}/${config.martingale.maxSteps} | signal=${signal.momentumType}`,
     };
     this.appendLog(userId, execLog);
 
     const tradeResult = await mode.wsClient.placeTrade(
-      this.buildTradePayload(session, config, amount, lossState.currentTrend),
+      this.buildTradePayload(session, config, amount, trend),
     );
 
     if (tradeResult?.dealId) {
@@ -974,6 +992,12 @@ export class MomentumService implements OnModuleDestroy {
 
           mode.sessionPnL += profit;
 
+          // ── Stop Loss / Stop Profit check ───────────────────────────────
+          if (this.checkStopConditions(userId, mode, config)) {
+            clearInterval(checkInterval);
+            return;
+          }
+
           this.updateLog(userId, orderId, {
             result: isWin ? 'WIN' : 'LOSE',
             profit,
@@ -982,22 +1006,31 @@ export class MomentumService implements OnModuleDestroy {
 
           if (isWin) {
             mode.totalWins++;
-            this.logger.log(`[${userId}] Always Signal: WIN at step ${step}`);
+            this.logger.log(`[${userId}] ✅ Always Signal: WIN at step ${step} — loss state di-reset`);
             mode.alwaysSignalLossState = null;
           } else {
             mode.totalLosses++;
             const newTotalLoss = (lossState.totalLoss || 0) + amount;
 
             if (step >= config.martingale.maxSteps) {
-              this.logger.log(`[${userId}] Always Signal: Max steps reached - RESET`);
+              this.logger.log(
+                `[${userId}] 📊 Always Signal: Max steps (${config.martingale.maxSteps}) reached — loss state di-reset`
+              );
               mode.alwaysSignalLossState = null;
             } else {
+              // FIX: spread lossState dan override field yang berubah.
+              // currentTrend tidak ada lagi di state — trend mengikuti sinyal baru.
               mode.alwaysSignalLossState = {
-                ...lossState,
+                hasOutstandingLoss: true,
                 currentMartingaleStep: step + 1,
+                originalOrderId: lossState.originalOrderId,
                 totalLoss: newTotalLoss,
+                momentumType: lossState.momentumType,
               };
-              this.logger.log(`[${userId}] Always Signal: LOSE at step ${step}, next step=${step + 1}`);
+              this.logger.log(
+                `[${userId}] 📊 Always Signal: LOSE at step ${step}→${step + 1}/${config.martingale.maxSteps} ` +
+                `lossAmount=${amount} totalLoss=${newTotalLoss}`
+              );
             }
           }
         }
@@ -1046,6 +1079,12 @@ export class MomentumService implements OnModuleDestroy {
 
           mode.sessionPnL += profit;
 
+          // ── Stop Loss / Stop Profit check ───────────────────────────────
+          if (this.checkStopConditions(userId, mode, config)) {
+            clearInterval(checkInterval);
+            return;
+          }
+
           this.updateLog(userId, orderId, {
             result: isWin ? 'WIN' : 'LOSE',
             profit,
@@ -1060,14 +1099,20 @@ export class MomentumService implements OnModuleDestroy {
             if (config.martingale.isEnabled && !config.martingale.isAlwaysSignal) {
               await this.startMartingale(userId, config, session, orderId, momentumType, 1);
             } else if (config.martingale.isAlwaysSignal) {
+              // FIX: currentTrend dihapus — trend mengikuti sinyal momentum berikutnya.
+              // totalLoss adalah akumulasi dari loss sebelumnya (jika ada).
+              const prevTotalLoss = mode.alwaysSignalLossState?.totalLoss ?? 0;
               mode.alwaysSignalLossState = {
                 hasOutstandingLoss: true,
                 currentMartingaleStep: 1,
                 originalOrderId: orderId,
-                totalLoss: amount,
-                currentTrend: mode.activeMomentumOrders.get(momentumType)?.trend || 'call',
+                totalLoss: prevTotalLoss + amount,
                 momentumType,
               };
+              this.logger.log(
+                `[${userId}] 📊 Always Signal: Loss recorded step=0→1/${config.martingale.maxSteps} ` +
+                `lossAmount=${amount} totalLoss=${prevTotalLoss + amount}`
+              );
               mode.activeMomentumOrders.delete(momentumType);
             } else {
               mode.totalLosses++;
@@ -1111,6 +1156,10 @@ export class MomentumService implements OnModuleDestroy {
     const amount = matchedLog.amount;
     const profit = isWin ? (payload.win || payload.payment || 0) : -amount;
     mode.sessionPnL += profit;
+
+    // ── Stop Loss / Stop Profit check ─────────────────────────────────────
+    const config = this.configs.get(userId);
+    if (config && this.checkStopConditions(userId, mode, config)) return;
 
     this.updateLog(userId, matchedLog.orderId, {
       result: isWin ? 'WIN' : 'LOSE',
@@ -1232,6 +1281,12 @@ export class MomentumService implements OnModuleDestroy {
           const profit = isWin ? (result.win || result.payment || 0) : -martingaleAmount;
 
           mode.sessionPnL += profit;
+
+          // ── Stop Loss / Stop Profit check ───────────────────────────────
+          if (this.checkStopConditions(userId, mode, config)) {
+            clearInterval(checkInterval);
+            return;
+          }
 
           this.updateLog(userId, parentOrderId, {
             result: isWin ? 'WIN' : 'LOSE',
@@ -1411,6 +1466,56 @@ export class MomentumService implements OnModuleDestroy {
       'Origin': 'https://stockity.id',
       'Referer': 'https://stockity.id/',
     };
+  }
+
+  /**
+   * Cek apakah Stop Loss atau Stop Profit telah tercapai.
+   * Menghentikan bot secara otomatis jika ya.
+   * @returns true jika bot dihentikan, false jika tidak
+   */
+  private checkStopConditions(userId: string, mode: ActiveModeState, config: MomentumConfig): boolean {
+    const { stopLoss, stopProfit } = config.martingale;
+
+    if (stopLoss && stopLoss > 0 && mode.sessionPnL <= -stopLoss) {
+      this.logger.log(
+        `[${userId}] 🛑 Stop Loss tercapai: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}. Bot dihentikan.`,
+      );
+      // Tulis log sebelum stop
+      const stopLog: MomentumLog = {
+        id: `stoploss_${Date.now()}`,
+        orderId: 'system',
+        momentumType: MomentumType.CANDLE_SABIT, // placeholder
+        trend: '-',
+        amount: 0,
+        martingaleStep: 0,
+        executedAt: Date.now(),
+        note: `⛔ Stop Loss triggered: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}`,
+      };
+      this.appendLog(userId, stopLog);
+      this.stopMomentumMode(userId);
+      return true;
+    }
+
+    if (stopProfit && stopProfit > 0 && mode.sessionPnL >= stopProfit) {
+      this.logger.log(
+        `[${userId}] ✅ Stop Profit tercapai: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}. Bot dihentikan.`,
+      );
+      const stopLog: MomentumLog = {
+        id: `stopprofit_${Date.now()}`,
+        orderId: 'system',
+        momentumType: MomentumType.CANDLE_SABIT, // placeholder
+        trend: '-',
+        amount: 0,
+        martingaleStep: 0,
+        executedAt: Date.now(),
+        note: `🎯 Stop Profit triggered: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}`,
+      };
+      this.appendLog(userId, stopLog);
+      this.stopMomentumMode(userId);
+      return true;
+    }
+
+    return false;
   }
 
   private sleep(ms: number): Promise<void> {

@@ -42,12 +42,13 @@ export interface IndicatorLog {
   isDemoAccount?: boolean;
 }
 
+// currentTrend dihapus: trend martingale mengikuti sinyal indicator baru,
+// bukan disimpan dari order yang LOSE.
 export interface IndicatorAlwaysSignalLossState {
   hasOutstandingLoss: boolean;
   currentMartingaleStep: number;
   originalOrderId: string;
   totalLoss: number;
-  currentTrend: string;
 }
 
 export interface IndicatorConfig {
@@ -60,6 +61,16 @@ export interface IndicatorConfig {
     multiplierValue: number;
     multiplierType: 'FIXED' | 'PERCENTAGE';
     isAlwaysSignal: boolean;
+    /**
+     * Stop Loss: bot otomatis berhenti jika total kerugian sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopLoss?: number;
+    /**
+     * Stop Profit: bot otomatis berhenti jika total keuntungan sesi
+     * mencapai atau melebihi nilai ini. 0 = nonaktif.
+     */
+    stopProfit?: number;
   };
   isDemoAccount: boolean;
   currency: string;
@@ -130,6 +141,8 @@ export class IndicatorService implements OnModuleDestroy {
           multiplierValue: 2.5,
           multiplierType: 'FIXED',
           isAlwaysSignal: false,
+          stopLoss: 0,
+          stopProfit: 0,
         },
         isDemoAccount: doc.is_demo_account ?? true,
         currency: doc.currency || 'IDR',
@@ -148,6 +161,8 @@ export class IndicatorService implements OnModuleDestroy {
         multiplierValue: 2.5,
         multiplierType: 'FIXED',
         isAlwaysSignal: false,
+        stopLoss: 0,
+        stopProfit: 0,
       },
       isDemoAccount: true,
       currency: 'IDR',
@@ -345,15 +360,9 @@ export class IndicatorService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode || !mode.isActive) return;
 
-    // Check Always Signal - jika ada loss yang belum tertutupi, eksekusi martingale
-    if (config.martingale.isAlwaysSignal && mode.alwaysSignalLossState?.hasOutstandingLoss) {
-      this.logger.log(
-        `[${userId}] 🔄 Indicator: Always Signal active - executing martingale step ` +
-        `${mode.alwaysSignalLossState.currentMartingaleStep}`
-      );
-      await this.executeAlwaysSignalMartingale(userId, config, session);
-      return;
-    }
+    // Always Signal: TIDAK lagi bypass analisis candle.
+    // Siklus berjalan normal (fetch candle → analisis → eksekusi).
+    // executeTrade() akan otomatis menggunakan step & amount dari alwaysSignalLossState.
 
     try {
       mode.cycleNumber++;
@@ -410,64 +419,10 @@ export class IndicatorService implements OnModuleDestroy {
     }
   }
 
-  private async executeAlwaysSignalMartingale(userId: string, config: IndicatorConfig, session: any) {
-    const mode = this.activeModes.get(userId);
-    if (!mode || !mode.alwaysSignalLossState) return;
-
-    const lossState = mode.alwaysSignalLossState;
-    const step = lossState.currentMartingaleStep;
-
-    if (step > config.martingale.maxSteps) {
-      this.logger.log(`[${userId}] Always Signal: Max steps reached - RESET`);
-      mode.alwaysSignalLossState = null;
-      await this.handleCycleCompletion(userId, 'MARTINGALE_FAILED', 'Max steps reached');
-      return;
-    }
-
-    const amount = this.calculateMartingaleAmount(config, step);
-    const trend = lossState.currentTrend;
-
-    mode.isTradeExecuted = true;
-    mode.currentMartingaleStep = step;
-    mode.isHandlingResult = false;
-
-    const orderId = uuidv4();
-    mode.activeOrderId = orderId;
-    mode.activeOrderTrend = trend;
-    mode.activeOrderAmount = amount;
-    mode.activeOrderExecutedAt = Date.now();
-    mode.totalExecutions++;
-
-    this.writeLog(userId, {
-      id: `${orderId}_s${step}`,
-      orderId,
-      trend,
-      amount,
-      martingaleStep: step,
-      executedAt: Date.now(),
-      indicatorType: mode.analysisResult?.indicatorType ?? 'UNKNOWN',
-      cycleNumber: mode.cycleNumber,
-      note: `Always Signal Martingale step ${step}/${config.martingale.maxSteps}`,
-    });
-
-    this.logger.log(`[${userId}] Always Signal: Executing step ${step}/${config.martingale.maxSteps}`);
-
-    const tradeResult = await mode.wsClient.placeTrade(
-      this.buildTradePayload(session, config, amount, trend),
-    );
-
-    if (!tradeResult?.dealId) {
-      this.logger.error(`[${userId}] Always Signal trade failed: ${tradeResult?.error}`);
-      mode.alwaysSignalLossState = null;
-      await this.handleCycleCompletion(userId, 'MARTINGALE_FAILED', 'Trade placement error');
-      return;
-    }
-
-    mode.activeDealId = tradeResult.dealId;
-    this.logger.log(`[${userId}] Always Signal trade placed: step=${step} dealId=${tradeResult.dealId}`);
-
-    this.startResultTimeout(userId, orderId, session, config, step);
-  }
+  // executeAlwaysSignalMartingale() dihapus.
+  // Logika always signal sekarang di-handle langsung di executeTrade():
+  // jika alwaysSignalLossState aktif, step & amount di-override otomatis,
+  // sedangkan trend tetap dari sinyal indicator baru (bukan dari loss state).
 
   private async waitForMinuteBoundary(): Promise<void> {
     const now = Date.now();
@@ -907,12 +862,33 @@ export class IndicatorService implements OnModuleDestroy {
     const mode = this.activeModes.get(userId);
     if (!mode || mode.isTradeExecuted) return;
 
+    // Always Signal: jika ada outstanding loss, override step & amount.
+    // Trend tetap dari prediction (hasil analisis indicator baru) — bukan trend lama.
+    const alwaysSignalActive =
+      config.martingale.isEnabled &&
+      config.martingale.isAlwaysSignal &&
+      mode.alwaysSignalLossState?.hasOutstandingLoss;
+
+    const effectiveStep = alwaysSignalActive
+      ? mode.alwaysSignalLossState!.currentMartingaleStep
+      : 0;
+
+    const amount = alwaysSignalActive
+      ? this.calculateMartingaleAmount(config, effectiveStep)
+      : config.settings.amount;
+
+    if (alwaysSignalActive) {
+      this.logger.log(
+        `[${userId}] 🔄 Always Signal override: step=${effectiveStep}/${config.martingale.maxSteps} ` +
+        `amount=${amount} trend=${prediction.recommendedTrend} (dari sinyal indicator baru)`
+      );
+    }
+
     mode.isTradeExecuted = true;
-    mode.currentMartingaleStep = 0;
+    mode.currentMartingaleStep = effectiveStep;
     mode.isHandlingResult = false;
 
     const orderId = uuidv4();
-    const amount = config.settings.amount;
 
     const order: IndicatorOrder = {
       id: orderId,
@@ -1051,6 +1027,9 @@ export class IndicatorService implements OnModuleDestroy {
     else if (!isDraw) tradePnL = -mode.activeOrderAmount;
     mode.sessionPnL += tradePnL;
 
+    // ── Stop Loss / Stop Profit check ─────────────────────────────────────
+    if (this.checkStopConditions(userId, mode, config)) return;
+
     const resultLogId = `${mode.activeOrderId}_s${step}`;
     this.writeLog(userId, {
       id: resultLogId,
@@ -1100,21 +1079,30 @@ export class IndicatorService implements OnModuleDestroy {
 
       if (config.martingale.isEnabled) {
         if (config.martingale.isAlwaysSignal) {
-          // Always Signal mode - record loss and wait for next signal
-          const nextStep = step + 1;
+          // Always Signal mode: catat loss, tunggu sinyal indicator berikutnya.
+          // executeTrade() pada siklus berikutnya akan override step & amount secara otomatis.
+          // currentTrend TIDAK disimpan — trend mengikuti sinyal indicator baru.
+          const currentStep = step;
+          const nextStep = currentStep + 1;
+          const prevTotalLoss = mode.alwaysSignalLossState?.totalLoss ?? 0;
+          const newTotalLoss = prevTotalLoss + mode.activeOrderAmount;
+
           if (nextStep <= config.martingale.maxSteps) {
             mode.alwaysSignalLossState = {
               hasOutstandingLoss: true,
               currentMartingaleStep: nextStep,
               originalOrderId: mode.activeOrderId!,
-              totalLoss: mode.activeOrderAmount,
-              currentTrend: mode.activeOrderTrend!,
+              totalLoss: newTotalLoss,
             };
             this.logger.log(
-              `[${userId}] 📊 Always Signal: Loss recorded, step ${nextStep}/${config.martingale.maxSteps}`
+              `[${userId}] 📊 Always Signal: Loss recorded step=${currentStep}→${nextStep}/${config.martingale.maxSteps} ` +
+              `lossAmount=${mode.activeOrderAmount} totalLoss=${newTotalLoss}`
             );
           } else {
-            this.logger.log(`[${userId}] Always Signal: Max steps reached`);
+            // Max step tercapai — reset, siklus selesai dengan LOSE
+            this.logger.log(
+              `[${userId}] 📊 Always Signal: Max steps (${config.martingale.maxSteps}) reached — loss state di-reset`
+            );
             mode.alwaysSignalLossState = null;
           }
           await this.handleCycleCompletion(userId, 'ALWAYS_SIGNAL_WAITING', 'Waiting for next signal');
@@ -1188,11 +1176,17 @@ export class IndicatorService implements OnModuleDestroy {
   }
 
   private calculateMartingaleAmount(config: IndicatorConfig, step: number): number {
+    // Gunakan martingale.baseAmount (bukan settings.amount) sebagai base kalkulasi.
+    // settings.amount adalah amount untuk trade normal (step 0),
+    // martingale.baseAmount adalah base yang dikonfigurasi user khusus untuk martingale.
+    const base = config.martingale.baseAmount;
+    if (step === 0) return base;
+
     const multiplier = config.martingale.multiplierType === 'FIXED'
       ? config.martingale.multiplierValue
       : 1 + config.martingale.multiplierValue / 100;
 
-    return Math.floor(config.settings.amount * Math.pow(multiplier, step));
+    return Math.floor(base * Math.pow(multiplier, step));
   }
 
   private startResultTimeout(
@@ -1435,6 +1429,53 @@ export class IndicatorService implements OnModuleDestroy {
     await this.supabaseService.client.from('indicator_status').upsert(
       { user_id: userId, bot_state: botState, updated_at: this.supabaseService.now() },
     );
+  }
+
+  /**
+   * Cek apakah Stop Loss atau Stop Profit telah tercapai.
+   * Menghentikan bot secara otomatis jika ya.
+   * @returns true jika bot dihentikan, false jika tidak
+   */
+  private checkStopConditions(userId: string, mode: ActiveMode, config: IndicatorConfig): boolean {
+    const { stopLoss, stopProfit } = config.martingale;
+
+    if (stopLoss && stopLoss > 0 && mode.sessionPnL <= -stopLoss) {
+      this.logger.log(
+        `[${userId}] 🛑 Stop Loss tercapai: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}. Bot dihentikan.`,
+      );
+      this.writeLog(userId, {
+        id: `stoploss_${Date.now()}`,
+        orderId: mode.activeOrderId ?? 'system',
+        trend: mode.activeOrderTrend ?? '-',
+        amount: 0,
+        martingaleStep: mode.currentMartingaleStep,
+        executedAt: Date.now(),
+        note: `⛔ Stop Loss triggered: sessionPnL=${mode.sessionPnL} ≤ -${stopLoss}`,
+        isDemoAccount: config.isDemoAccount,
+      });
+      this.stopIndicatorMode(userId);
+      return true;
+    }
+
+    if (stopProfit && stopProfit > 0 && mode.sessionPnL >= stopProfit) {
+      this.logger.log(
+        `[${userId}] ✅ Stop Profit tercapai: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}. Bot dihentikan.`,
+      );
+      this.writeLog(userId, {
+        id: `stopprofit_${Date.now()}`,
+        orderId: mode.activeOrderId ?? 'system',
+        trend: mode.activeOrderTrend ?? '-',
+        amount: 0,
+        martingaleStep: mode.currentMartingaleStep,
+        executedAt: Date.now(),
+        note: `🎯 Stop Profit triggered: sessionPnL=${mode.sessionPnL} ≥ ${stopProfit}`,
+        isDemoAccount: config.isDemoAccount,
+      });
+      this.stopIndicatorMode(userId);
+      return true;
+    }
+
+    return false;
   }
 
   private sleep(ms: number): Promise<void> {
