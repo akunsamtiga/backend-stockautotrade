@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'stockautotrade-backend',
+      name: 'stockity-schedule-vps',
       script: 'dist/main.js',
       instances: 1,
       autorestart: true,
@@ -9,6 +9,7 @@ module.exports = {
       max_memory_restart: '512M',
       env: {
         NODE_ENV: 'production',
+        LOGIN_PROXY: 'socks5h://127.0.0.1:1080',
       },
       error_file: './logs/error.log',
       out_file: './logs/out.log',
